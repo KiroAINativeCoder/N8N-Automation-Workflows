@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  One-click deploy n8n on AWS. Creates VPC, EC2 instance, persistent storage.
+  Authentication uses n8n's built-in user management (invite-only, no public
+  sign-up). Access via SSM Session Manager (no SSH key needed).
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: EC2 instance type. t3.small is the recommended minimum.
+
+  AllowedHTTPCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >-
+      CIDR allowed to reach the n8n web UI. Default 0.0.0.0/0 keeps the URL
+      public so invited users can log in from anywhere. Login is gated by
+      n8n's user management — only invited accounts can authenticate.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+
+  N8nVersion:
+    Type: String
+    Default: latest
+    Description: n8n Docker image tag.
+
+  DataVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 500
+    Description: Size in GB for persistent workflow data.
+
+  GenericTimezone:
+    Type: String
+    Default: UTC
+    Description: Timezone for scheduled workflows (e.g. America/New_York, Asia/Kolkata).
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (auto-resolved).
+
+Resources:
+  # ===== Encryption key for n8n credentials at rest =====
+  # n8n uses this to encrypt stored credentials in the database. If lost,
+  # all saved credentials become unrecoverable. Stored in Secrets Manager.
+  N8nEncryptionKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}-n8n-encryption-key
+      Description: n8n encryption key for credentials at rest. DO NOT lose this.
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+        IncludeSpace: false
+
+  # ===== Networking =====
+  N8nVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  N8nInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  N8nVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref N8nVPC
+      InternetGatewayId: !Ref N8nInternetGateway
+
+  N8nPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref N8nVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-subnet
+
+  N8nRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref N8nVPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-rt
+
+  N8nDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: N8nVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref N8nRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref N8nInternetGateway
+
+  N8nSubnetRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref N8nPublicSubnet
+      RouteTableId: !Ref N8nRouteTable
+
+  # ===== Security =====
+  N8nSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: n8n web UI access
+      VpcId: !Ref N8nVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5678
+          ToPort: 5678
+          CidrIp: !Ref AllowedHTTPCidr
+          Description: n8n web UI
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-sg
+
+  # ===== Storage =====
+  N8nDataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-data
+
+  # ===== IAM =====
+  N8nIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadN8nSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref N8nEncryptionKey
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-role
+
+  N8nInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref N8nIAMRole
+
+  # ===== Public IP =====
+  N8nElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: N8nVPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-eip
+
+  N8nEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt N8nElasticIP.AllocationId
+      InstanceId: !Ref N8nInstance
+
+  # ===== EC2 instance =====
+  N8nInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - N8nVPCGatewayAttachment
+      - N8nEncryptionKey
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref N8nInstanceProfile
+      SubnetId: !Ref N8nPublicSubnet
+      SecurityGroupIds:
+        - !Ref N8nSecurityGroup
+      Volumes:
+        - Device: /dev/sdf
+          VolumeId: !Ref N8nDataVolume
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          # Install Docker + tools
+          dnf update -y
+          dnf install -y docker jq
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+
+          # Docker Compose v2 plugin
+          DOCKER_CONFIG=/usr/local/lib/docker
+          mkdir -p $DOCKER_CONFIG/cli-plugins
+          curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+            -o $DOCKER_CONFIG/cli-plugins/docker-compose
+          chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
+
+          # Mount persistent data volume (Nitro maps /dev/sdf -> /dev/nvme1n1)
+          DEVICE=/dev/sdf
+          for i in {1..30}; do
+            if [ -e /dev/nvme1n1 ]; then DEVICE=/dev/nvme1n1; break; fi
+            if [ -e /dev/sdf ]; then break; fi
+            sleep 2
+          done
+
+          if ! blkid $DEVICE; then
+            mkfs -t xfs $DEVICE
+          fi
+
+          mkdir -p /opt/n8n-data
+          mount $DEVICE /opt/n8n-data
+          echo "$DEVICE /opt/n8n-data xfs defaults,nofail 0 2" >> /etc/fstab
+          chown -R 1000:1000 /opt/n8n-data
+
+          # Pull encryption key from Secrets Manager
+          ENCRYPTION_KEY=$(aws secretsmanager get-secret-value \
+            --region ${AWS::Region} \
+            --secret-id ${N8nEncryptionKey} \
+            --query SecretString --output text)
+
+          mkdir -p /opt/n8n
+
+          # Write .env file (sed strips YAML block-scalar leading whitespace).
+          # A separate .env file avoids YAML indentation pitfalls and makes
+          # future edits trivial: just append KEY=VALUE lines and restart.
+          cat <<ENVFILE | sed 's/^[[:space:]]*//' > /opt/n8n/.env
+          # Network
+          N8N_HOST=0.0.0.0
+          N8N_PORT=5678
+          N8N_PROTOCOL=http
+          N8N_SECURE_COOKIE=false
+
+          # Encryption (DO NOT change after first deploy — credentials become unreadable)
+          N8N_ENCRYPTION_KEY=$ENCRYPTION_KEY
+
+          # Telemetry / branding
+          N8N_DIAGNOSTICS_ENABLED=false
+          N8N_HIRING_BANNER_ENABLED=false
+          N8N_TEMPLATES_ENABLED=true
+          GENERIC_TIMEZONE=${GenericTimezone}
+
+          # Auth & user management
+          # User management is enabled by default. The first visitor to /setup
+          # claims the owner account. Only invited users can sign up after that.
+          N8N_USER_MANAGEMENT_DISABLED=false
+
+          # Disable the public REST API surface to reduce attack area
+          N8N_PUBLIC_API_DISABLED=true
+
+          # Block community-node installation in the UI (optional security hardening)
+          N8N_COMMUNITY_PACKAGES_ENABLED=false
+          ENVFILE
+          chmod 600 /opt/n8n/.env
+
+          # Write docker-compose.yml — references .env via env_file
+          cat > /opt/n8n/docker-compose.yml <<COMPOSE
+          services:
+            n8n:
+              image: n8nio/n8n:${N8nVersion}
+              restart: unless-stopped
+              ports:
+                - "5678:5678"
+              env_file:
+                - .env
+              volumes:
+                - /opt/n8n-data:/home/node/.n8n
+          COMPOSE
+
+          cd /opt/n8n
+          docker compose up -d
+
+          echo "n8n bootstrap complete at $(date)" > /var/log/n8n-bootstrap.log
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-n8n
+
+Outputs:
+  N8nURL:
+    Description: URL to access the n8n web UI (wait ~3 min after stack completes)
+    Value: !Sub http://${N8nElasticIP}:5678
+
+  ClaimOwnerAccountURL:
+    Description: >-
+      URGENT — visit this URL within 5 min of stack completion to claim the
+      owner account before anyone else does. After this, only invited users
+      can sign up.
+    Value: !Sub http://${N8nElasticIP}:5678/setup
+
+  EncryptionKeySecretArn:
+    Description: ARN of the n8n credential-encryption key in Secrets Manager
+    Value: !Ref N8nEncryptionKey
+
+  GetEncryptionKeyCommand:
+    Description: AWS CLI command to retrieve the encryption key (back this up!)
+    Value: !Sub >-
+      aws secretsmanager get-secret-value
+      --region ${AWS::Region}
+      --secret-id ${N8nEncryptionKey}
+      --query SecretString --output text
+
+  ConnectViaSessionManager:
+    Description: Connect to instance shell via SSM (no SSH key needed)
+    Value: !Sub aws ssm start-session --region ${AWS::Region} --target ${N8nInstance}
+
+  ElasticIP:
+    Description: Public IP of the n8n instance
+    Value: !Ref N8nElasticIP
